@@ -3,6 +3,74 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 from format_xml import process_xml_directory
 import numpy as np
+from functools import lru_cache
+import re
+
+class FlowCache:
+    """Cache for flow names from UUIDs"""
+    def __init__(self, flows_dir='flows'):
+        self.flows_dir = flows_dir
+        self._cache = {}  # uuid -> {name, basename, synonyms}
+    
+    @lru_cache(maxsize=1000)
+    def get_flow_info(self, uuid):
+        """Get flow information (name, basename, synonyms) from UUID using cache"""
+        if uuid in self._cache:
+            return self._cache[uuid]
+        
+        # Try to find the flow file
+        flow_file = os.path.join(self.flows_dir, f"{uuid}.xml")
+        if not os.path.exists(flow_file):
+            return None
+        
+        try:
+            # Parse the XML file
+            tree = ET.parse(flow_file)
+            root = tree.getroot()
+            
+            # Define namespaces
+            ns = {
+                'common': 'http://www.EcoInvent.org/EcoSpold01',
+                'ns3': 'http://www.EcoInvent.org/Extensions'
+            }
+            
+            # Get flow information
+            flow_info = {}
+            
+            # Get short description (main name)
+            short_desc = root.find('.//common:shortDescription', ns)
+            if short_desc is not None:
+                flow_info['name'] = short_desc.text.strip()
+            
+            # Get baseName if available
+            base_name = root.find('.//ns3:baseName', ns)
+            if base_name is not None:
+                flow_info['basename'] = base_name.text.strip()
+            
+            # Get synonyms if available
+            synonyms = []
+            for synonym in root.findall('.//ns3:synonym', ns):
+                if synonym.text:
+                    synonyms.append(synonym.text.strip())
+            if synonyms:
+                flow_info['synonyms'] = synonyms
+            
+            if flow_info:
+                self._cache[uuid] = flow_info
+                return flow_info
+                
+        except Exception as e:
+            print(f"Error parsing flow file {flow_file}: {str(e)}")
+        
+        return None
+    
+    def get_flow_name(self, uuid):
+        """Get primary flow name from UUID"""
+        info = self.get_flow_info(uuid)
+        return info['name'] if info and 'name' in info else None
+
+# Initialize global flow cache
+flow_cache = FlowCache()
 
 def load_characterization_matrix(file_path):
     """Load the characterization matrix from a CSV file."""
@@ -28,19 +96,104 @@ def normalize_flow_name(name):
         return str(name)
     
     # Remove content in brackets and parentheses
-    name = name.split('[')[0].split('(')[0]
+    name = re.sub(r'\[.*?\]', '', name)  # Remove everything in square brackets
+    name = re.sub(r'\(.*?\)', '', name)  # Remove everything in parentheses
     
     # Convert to lowercase
     name = name.lower()
     
-    # Remove special characters and multiple spaces
-    name = ''.join(c for c in name if c.isalnum() or c.isspace())
+    # Remove special characters but keep spaces and hyphens
+    name = re.sub(r'[^\w\s-]', '', name)
+    
+    # Replace multiple spaces with single space
     name = ' '.join(name.split())
+    
+    # Remove common prefixes and suffixes
+    name = re.sub(r'^(the|a|an)\s+', '', name)
+    name = re.sub(r'\s+(the|a|an)$', '', name)
+    
+    # Remove common chemical prefixes
+    name = re.sub(r'^(alpha|beta|gamma|delta|epsilon|zeta|eta|theta|iota|kappa|lambda|mu|nu|xi|omicron|pi|rho|sigma|tau|upsilon|phi|chi|psi|omega)-', '', name)
+    
+    # Remove common chemical suffixes
+    name = re.sub(r'-(ic|ous|ide|ate|ite|ol|al|one|ene|yne|ane)$', '', name)
+    
+    # Remove CAS numbers and other identifiers
+    name = re.sub(r'\d{2,7}-\d{2}-\d', '', name)  # CAS numbers
+    name = re.sub(r'[A-Z]{2,3}\d{4,6}', '', name)  # Common chemical identifiers
     
     return name.strip()
 
+def extract_uuid(flow_name):
+    """Extract UUID from a flow name that may contain brackets or parentheses"""
+    if not flow_name:
+        return None
+        
+    # Try different formats:
+    # 1. Before square brackets: "uuid [compartment]"
+    # 2. Before parentheses: "uuid (compartment)"
+    # 3. Plain UUID format
+    parts = flow_name.split('[')[0].split('(')[0].strip()
+    
+    # Check if the remaining part matches UUID format (8-4-4-4-12 hexadecimal)
+    uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+    if uuid_pattern.match(parts):
+        return parts
+    return None
+
 def find_matching_flow(flow_name, compartment, cf_matrix):
     """Find the matching flow name in the characterization matrix"""
+    # First try to find matches using UUID and flow info
+    try:
+        uuid = extract_uuid(flow_name)
+        if uuid:
+            flow_info = flow_cache.get_flow_info(uuid)
+            if flow_info:
+                normalized_matrix_names = cf_matrix.index.get_level_values('Flow name').map(normalize_flow_name)
+                normalized_compartment = normalize_compartment(compartment)
+                
+                # Try matching with all available names
+                for name_type, name_value in flow_info.items():
+                    if name_type == 'synonyms':
+                        # Try each synonym
+                        for synonym in name_value:
+                            # Try exact match with compartment
+                            if (synonym, compartment) in cf_matrix.index:
+                                return [(synonym, compartment)]
+                            
+                            # Try normalized match with compartment
+                            normalized_name = normalize_flow_name(synonym)
+                            if normalized_name:
+                                # Try exact compartment match first
+                                matches = (normalized_matrix_names == normalized_name) & (cf_matrix.index.get_level_values('Compartment') == normalized_compartment)
+                                if matches.any():
+                                    return [idx for idx in cf_matrix.index[matches]]
+                                
+                                # If no exact compartment match, try any compartment
+                                matches = normalized_matrix_names == normalized_name
+                                if matches.any():
+                                    return [idx for idx in cf_matrix.index[matches]]
+                    else:
+                        # Try exact match with compartment for name or basename
+                        if (name_value, compartment) in cf_matrix.index:
+                            return [(name_value, compartment)]
+                        
+                        # Try normalized match with compartment
+                        normalized_name = normalize_flow_name(name_value)
+                        if normalized_name:
+                            # Try exact compartment match first
+                            matches = (normalized_matrix_names == normalized_name) & (cf_matrix.index.get_level_values('Compartment') == normalized_compartment)
+                            if matches.any():
+                                return [idx for idx in cf_matrix.index[matches]]
+                            
+                            # If no exact compartment match, try any compartment
+                            matches = normalized_matrix_names == normalized_name
+                            if matches.any():
+                                return [idx for idx in cf_matrix.index[matches]]
+    except Exception as e:
+        print(f"Error trying to find exact flow name match: {str(e)}")
+    
+    # If no match found with UUID info, try regular matching
     # Normalize the flow name
     normalized_flow = normalize_flow_name(flow_name)
     if normalized_flow is None:
@@ -52,13 +205,16 @@ def find_matching_flow(flow_name, compartment, cf_matrix):
     
     # Try normalized match with compartment
     normalized_matrix_names = cf_matrix.index.get_level_values('Flow name').map(normalize_flow_name)
-    matches = (normalized_matrix_names == normalized_flow) & (cf_matrix.index.get_level_values('Compartment') == compartment)
+    normalized_compartment = normalize_compartment(compartment)
+    
+    # Try exact compartment match first
+    matches = (normalized_matrix_names == normalized_flow) & (cf_matrix.index.get_level_values('Compartment') == normalized_compartment)
     if matches.any():
         return [idx for idx in cf_matrix.index[matches]]
     
     # Try matching with original flow names
     if 'Flow name original' in cf_matrix.columns:
-        original_matches = (cf_matrix['Flow name original'].map(normalize_flow_name) == normalized_flow) & (cf_matrix.index.get_level_values('Compartment') == compartment)
+        original_matches = (cf_matrix['Flow name original'].map(normalize_flow_name) == normalized_flow) & (cf_matrix.index.get_level_values('Compartment') == normalized_compartment)
         if original_matches.any():
             return [idx for idx in cf_matrix.index[original_matches]]
     
@@ -88,13 +244,31 @@ def normalize_compartment(compartment):
         'air': 'emissions to air',
         'soil': 'emissions to soil',
         'water': 'emissions to water',
-        'resource': 'resource flow'
+        'resource': 'resource flow',
+        'unspecified': 'emissions to air',  # Default unspecified to air
+        'long-term': 'emissions to air',    # Default long-term to air
+        'lower stratosphere': 'emissions to air',
+        'upper troposphere': 'emissions to air',
+        'sea water': 'emissions to water',
+        'fresh water': 'emissions to water',
+        'ground water': 'emissions to water',
+        'surface water': 'emissions to water'
     }
     
     # Check if the compartment contains any of the mapped keywords
     for key, value in compartment_map.items():
         if key in compartment:
             return value
+    
+    # If no match found, try to extract the main compartment type
+    if 'air' in compartment:
+        return 'emissions to air'
+    elif 'water' in compartment:
+        return 'emissions to water'
+    elif 'soil' in compartment:
+        return 'emissions to soil'
+    elif 'resource' in compartment:
+        return 'resource flow'
     
     return compartment
 
