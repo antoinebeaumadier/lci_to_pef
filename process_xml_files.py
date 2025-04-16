@@ -5,6 +5,14 @@ from format_xml import process_xml_directory
 import numpy as np
 from functools import lru_cache
 import re
+from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import warnings
+from collections import defaultdict
+
+# Suppress pandas performance warnings
+warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
 class FlowCache:
     """Cache for flow names from UUIDs"""
@@ -72,24 +80,12 @@ class FlowCache:
 # Initialize global flow cache
 flow_cache = FlowCache()
 
-def load_characterization_matrix(file_path):
-    """Load the characterization matrix from a CSV file."""
-    # Read the CSV file, skipping the first row which is the title
-    cf_matrix = pd.read_csv(file_path, sep=';', skiprows=1)
-    
-    # Get the impact categories (columns 10-25)
-    impact_categories = cf_matrix.columns[10:26].tolist()
-    
-    # Create a multi-index using Flow name and Compartment
-    cf_matrix.set_index(['Flow name', 'Compartment'], inplace=True)
-    
-    # Keep only the impact categories and original flow name
-    cf_matrix = cf_matrix[impact_categories + ['Flow name original']]
-    
-    return cf_matrix
+# Cache for normalized values
+normalized_cache = {}
 
-def normalize_flow_name(name):
-    """Normalize a flow name for matching purposes"""
+@lru_cache(maxsize=10000)
+def cached_normalize_flow_name(name):
+    """Cached version of normalize_flow_name"""
     if name is None:
         return None
     if not isinstance(name, str):
@@ -102,8 +98,8 @@ def normalize_flow_name(name):
     # Convert to lowercase
     name = name.lower()
     
-    # Remove special characters but keep spaces and hyphens
-    name = re.sub(r'[^\w\s-]', '', name)
+    # Remove special characters but keep spaces, hyphens, and commas
+    name = re.sub(r'[^\w\s,-]', '', name)
     
     # Replace multiple spaces with single space
     name = ' '.join(name.split())
@@ -112,6 +108,7 @@ def normalize_flow_name(name):
     name = re.sub(r'^(the|a|an)\s+', '', name)
     name = re.sub(r'\s+(the|a|an)$', '', name)
     
+    # Handle chemical compound names
     # Remove common chemical prefixes
     name = re.sub(r'^(alpha|beta|gamma|delta|epsilon|zeta|eta|theta|iota|kappa|lambda|mu|nu|xi|omicron|pi|rho|sigma|tau|upsilon|phi|chi|psi|omega)-', '', name)
     
@@ -122,7 +119,84 @@ def normalize_flow_name(name):
     name = re.sub(r'\d{2,7}-\d{2}-\d', '', name)  # CAS numbers
     name = re.sub(r'[A-Z]{2,3}\d{4,6}', '', name)  # Common chemical identifiers
     
+    # Handle chemical compound variations
+    # Remove spaces around hyphens in chemical names
+    name = re.sub(r'\s*-\s*', '-', name)
+    
+    # Remove spaces around commas in chemical names
+    name = re.sub(r'\s*,\s*', ',', name)
+    
+    # Standardize common chemical prefixes
+    name = re.sub(r'^1,1,1-', '1,1,1-', name)
+    name = re.sub(r'^1,1-', '1,1-', name)
+    name = re.sub(r'^1,2-', '1,2-', name)
+    name = re.sub(r'^1,3-', '1,3-', name)
+    name = re.sub(r'^1,4-', '1,4-', name)
+    name = re.sub(r'^2,3-', '2,3-', name)
+    name = re.sub(r'^2,4-', '2,4-', name)
+    
+    # Standardize common chemical suffixes
+    name = re.sub(r'-dichloro$', '-dichloride', name)
+    name = re.sub(r'-trichloro$', '-trichloride', name)
+    name = re.sub(r'-tetrachloro$', '-tetrachloride', name)
+    name = re.sub(r'-pentachloro$', '-pentachloride', name)
+    name = re.sub(r'-hexachloro$', '-hexachloride', name)
+    
+    # Standardize common chemical names
+    name = re.sub(r'ethylene', 'ethene', name)
+    name = re.sub(r'propylene', 'propene', name)
+    name = re.sub(r'butylene', 'butene', name)
+    name = re.sub(r'benzene', 'benzol', name)
+    name = re.sub(r'toluene', 'methylbenzene', name)
+    name = re.sub(r'xylene', 'dimethylbenzene', name)
+    
+    # Remove any remaining special characters
+    name = re.sub(r'[^\w\s,-]', '', name)
+    
+    # Final cleanup
     return name.strip()
+
+@lru_cache(maxsize=1000)
+def cached_normalize_compartment(compartment):
+    """Cached version of normalize_compartment"""
+    if pd.isna(compartment):
+        return 'emissions to air'  # Default to emissions to air if not specified
+    
+    # Convert to lowercase and strip whitespace
+    compartment = str(compartment).lower().strip()
+    
+    # Map common variations to standard names
+    compartment_map = {
+        'air': 'emissions to air',
+        'soil': 'emissions to soil',
+        'water': 'emissions to water',
+        'resource': 'resource flow',
+        'unspecified': 'emissions to air',  # Default unspecified to air
+        'long-term': 'emissions to air',    # Default long-term to air
+        'lower stratosphere': 'emissions to air',
+        'upper troposphere': 'emissions to air',
+        'sea water': 'emissions to water',
+        'fresh water': 'emissions to water',
+        'ground water': 'emissions to water',
+        'surface water': 'emissions to water'
+    }
+    
+    # Check if the compartment contains any of the mapped keywords
+    for key, value in compartment_map.items():
+        if key in compartment:
+            return value
+    
+    # If no match found, try to extract the main compartment type
+    if 'air' in compartment:
+        return 'emissions to air'
+    elif 'water' in compartment:
+        return 'emissions to water'
+    elif 'soil' in compartment:
+        return 'emissions to soil'
+    elif 'resource' in compartment:
+        return 'resource flow'
+    
+    return compartment
 
 def extract_uuid(flow_name):
     """Extract UUID from a flow name that may contain brackets or parentheses"""
@@ -149,8 +223,9 @@ def find_matching_flow(flow_name, compartment, cf_matrix):
         if uuid:
             flow_info = flow_cache.get_flow_info(uuid)
             if flow_info:
-                normalized_matrix_names = cf_matrix.index.get_level_values('Flow name').map(normalize_flow_name)
-                normalized_compartment = normalize_compartment(compartment)
+                # Get normalized values from cache or compute them
+                normalized_matrix_names = cf_matrix.index.get_level_values('Flow name').map(cached_normalize_flow_name)
+                normalized_compartment = cached_normalize_compartment(compartment)
                 
                 # Try matching with all available names
                 for name_type, name_value in flow_info.items():
@@ -162,7 +237,7 @@ def find_matching_flow(flow_name, compartment, cf_matrix):
                                 return [(synonym, compartment)]
                             
                             # Try normalized match with compartment
-                            normalized_name = normalize_flow_name(synonym)
+                            normalized_name = cached_normalize_flow_name(synonym)
                             if normalized_name:
                                 # Try exact compartment match first
                                 matches = (normalized_matrix_names == normalized_name) & (cf_matrix.index.get_level_values('Compartment') == normalized_compartment)
@@ -179,7 +254,7 @@ def find_matching_flow(flow_name, compartment, cf_matrix):
                             return [(name_value, compartment)]
                         
                         # Try normalized match with compartment
-                        normalized_name = normalize_flow_name(name_value)
+                        normalized_name = cached_normalize_flow_name(name_value)
                         if normalized_name:
                             # Try exact compartment match first
                             matches = (normalized_matrix_names == normalized_name) & (cf_matrix.index.get_level_values('Compartment') == normalized_compartment)
@@ -195,7 +270,7 @@ def find_matching_flow(flow_name, compartment, cf_matrix):
     
     # If no match found with UUID info, try regular matching
     # Normalize the flow name
-    normalized_flow = normalize_flow_name(flow_name)
+    normalized_flow = cached_normalize_flow_name(flow_name)
     if normalized_flow is None:
         return None
     
@@ -204,8 +279,8 @@ def find_matching_flow(flow_name, compartment, cf_matrix):
         return [(flow_name, compartment)]
     
     # Try normalized match with compartment
-    normalized_matrix_names = cf_matrix.index.get_level_values('Flow name').map(normalize_flow_name)
-    normalized_compartment = normalize_compartment(compartment)
+    normalized_matrix_names = cf_matrix.index.get_level_values('Flow name').map(cached_normalize_flow_name)
+    normalized_compartment = cached_normalize_compartment(compartment)
     
     # Try exact compartment match first
     matches = (normalized_matrix_names == normalized_flow) & (cf_matrix.index.get_level_values('Compartment') == normalized_compartment)
@@ -214,9 +289,15 @@ def find_matching_flow(flow_name, compartment, cf_matrix):
     
     # Try matching with original flow names
     if 'Flow name original' in cf_matrix.columns:
-        original_matches = (cf_matrix['Flow name original'].map(normalize_flow_name) == normalized_flow) & (cf_matrix.index.get_level_values('Compartment') == normalized_compartment)
+        original_matches = (cf_matrix['Flow name original'].map(cached_normalize_flow_name) == normalized_flow) & (cf_matrix.index.get_level_values('Compartment') == normalized_compartment)
         if original_matches.any():
             return [idx for idx in cf_matrix.index[original_matches]]
+    
+    # Try matching with substance names from statistics
+    if 'Substance name as commonly in the statistics' in cf_matrix.columns:
+        stats_matches = (cf_matrix['Substance name as commonly in the statistics'].map(cached_normalize_flow_name) == normalized_flow) & (cf_matrix.index.get_level_values('Compartment') == normalized_compartment)
+        if stats_matches.any():
+            return [idx for idx in cf_matrix.index[stats_matches]]
     
     # If no match found with compartment, try without compartment
     matches = normalized_matrix_names == normalized_flow
@@ -225,10 +306,17 @@ def find_matching_flow(flow_name, compartment, cf_matrix):
     
     # Try one last time with original flow names without compartment
     if 'Flow name original' in cf_matrix.columns:
-        original_matches = cf_matrix['Flow name original'].map(normalize_flow_name) == normalized_flow
+        original_matches = cf_matrix['Flow name original'].map(cached_normalize_flow_name) == normalized_flow
         if original_matches.any():
             return [idx for idx in cf_matrix.index[original_matches]]
     
+    # Try one last time with substance names from statistics without compartment
+    if 'Substance name as commonly in the statistics' in cf_matrix.columns:
+        stats_matches = cf_matrix['Substance name as commonly in the statistics'].map(cached_normalize_flow_name) == normalized_flow
+        if stats_matches.any():
+            return [idx for idx in cf_matrix.index[stats_matches]]
+    
+    # If no match found, return None to indicate unmatched flow
     return None
 
 def normalize_compartment(compartment):
@@ -272,6 +360,77 @@ def normalize_compartment(compartment):
     
     return compartment
 
+def calculate_process_impacts(process_name, lci_data, cf_matrix, impact_categories):
+    """Calculate impacts for a single process"""
+    # Get flows for this process
+    process_flows = lci_data[lci_data['Process name'] == process_name]
+    
+    # Initialize process impacts array
+    process_impacts = np.zeros(len(impact_categories))
+    
+    # Track matched and unmatched flows
+    matched_count = 0
+    unmatched_flows = []
+    
+    # Calculate impacts for each flow
+    for _, flow in process_flows.iterrows():
+        flow_name = flow['Flow name']
+        amount = flow['Amount']
+        compartment = flow['Compartment']
+        
+        # Skip invalid amounts or names
+        if pd.isna(amount) or pd.isna(flow_name) or not isinstance(flow_name, str) or not flow_name.strip():
+            continue
+        
+        try:
+            # Convert amount to float
+            amount = float(amount)
+            
+            # Find matching flow(s)
+            matches = find_matching_flow(flow_name, compartment, cf_matrix)
+            if matches is not None and len(matches) > 0:
+                matched_count += 1
+                # Sum up characterization factors from all matches
+                total_factors = np.zeros(len(impact_categories))
+                for match in matches:
+                    try:
+                        factors = cf_matrix.loc[match, impact_categories].values
+                        if isinstance(factors, pd.Series):
+                            factors = factors.values
+                        factors = factors.astype(float)  # Ensure numeric type
+                        if len(factors.shape) > 1:
+                            factors = factors.mean(axis=0)  # Take mean if multiple values
+                        total_factors += factors
+                    except Exception as e:
+                        print(f"Warning: Error processing factors for flow '{flow_name}' match {match}: {str(e)}")
+                        continue
+                
+                # If we found multiple matches, take the average
+                if len(matches) > 1:
+                    total_factors /= len(matches)
+                
+                # Multiply amount by characterization factors and add to process impacts
+                impact = total_factors * amount
+                
+                # Check for invalid values before adding
+                if not np.any(np.isnan(impact)) and not np.any(np.isinf(impact)):
+                    process_impacts += impact
+            else:
+                # Add to unmatched flows list
+                unmatched_flows.append({
+                    'Process name': process_name,
+                    'Flow name': flow_name,
+                    'Compartment': compartment,
+                    'Amount': amount,
+                    'Normalized flow name': cached_normalize_flow_name(flow_name),
+                    'Normalized compartment': cached_normalize_compartment(compartment)
+                })
+        except Exception as e:
+            print(f"Error processing flow '{flow_name}' in process '{process_name}': {str(e)}")
+            continue
+    
+    return process_name, process_impacts, matched_count, unmatched_flows
+
 def calculate_impacts(lci_data, cf_matrix):
     """
     Calculate environmental impacts for each file based on LCI data and characterization factors.
@@ -291,106 +450,66 @@ def calculate_impacts(lci_data, cf_matrix):
     results = pd.DataFrame(0.0, index=unique_processes, columns=impact_categories)
     
     # Initialize counters for detailed statistics
-    total_flows = 0
-    matched_flows = 0
-    unmatched_flows = set()
-    invalid_amounts = 0
-    invalid_names = 0
-    skipped_flows = 0
+    total_flows = len(lci_data)
+    total_matched_flows = 0
+    invalid_amounts = sum(lci_data['Amount'].isna())
+    invalid_names = sum(lci_data['Flow name'].isna() | ~lci_data['Flow name'].astype(str).str.strip().astype(bool))
+    
+    # Initialize list to store unmatched flows
+    all_unmatched_flows = []
     
     # Convert characterization factors to numeric, replacing non-numeric values with 0
-    for col in impact_categories:
+    print("\nConverting characterization factors to numeric values...")
+    for col in tqdm(impact_categories, desc="Converting factors", position=0, leave=True):
         cf_matrix[col] = pd.to_numeric(cf_matrix[col], errors='coerce').fillna(0)
     
-    # Process each process separately
-    for process_name in unique_processes:
-        # Get flows for this process
-        process_flows = lci_data[lci_data['Process name'] == process_name]
-        total_flows += len(process_flows)
-        
-        # Initialize process impacts array
-        process_impacts = np.zeros(len(impact_categories))
-        
-        # Calculate impacts for each flow
-        for _, flow in process_flows.iterrows():
-            flow_name = flow['Flow name']
-            amount = flow['Amount']
-            compartment = flow['Compartment']
-            
-            # Track invalid amounts
-            if pd.isna(amount):
-                invalid_amounts += 1
-                print(f"Warning: Invalid amount for flow '{flow_name}' in process '{process_name}'")
-                continue
-            
-            # Track invalid names
-            if pd.isna(flow_name) or not isinstance(flow_name, str) or not flow_name.strip():
-                invalid_names += 1
-                print(f"Warning: Invalid flow name in process '{process_name}'")
-                continue
-            
-            try:
-                # Convert amount to float
-                amount = float(amount)
-                
-                # Find matching flow(s)
-                matches = find_matching_flow(flow_name, compartment, cf_matrix)
-                if matches is not None:
-                    matched_flows += 1
-                    # Sum up characterization factors from all matches
-                    total_factors = np.zeros(len(impact_categories))
-                    for match in matches:
-                        try:
-                            factors = cf_matrix.loc[match, impact_categories].values
-                            if isinstance(factors, pd.Series):
-                                factors = factors.values
-                            factors = factors.astype(float)  # Ensure numeric type
-                            if len(factors.shape) > 1:
-                                factors = factors.mean(axis=0)  # Take mean if multiple values
-                            total_factors += factors
-                        except Exception as e:
-                            print(f"Warning: Error processing factors for flow '{flow_name}' match {match}: {str(e)}")
-                            continue
-                    
-                    # If we found multiple matches, take the average
-                    if len(matches) > 1:
-                        total_factors /= len(matches)
-                    
-                    # Multiply amount by characterization factors and add to process impacts
-                    impact = total_factors * amount
-                    
-                    # Check for invalid values before adding
-                    if not np.any(np.isnan(impact)) and not np.any(np.isinf(impact)):
-                        process_impacts += impact
-                    else:
-                        skipped_flows += 1
-                        print(f"Warning: Invalid impact values for flow '{flow_name}' in process '{process_name}'")
-                else:
-                    unmatched_flows.add(f"{flow_name} ({compartment})")
-            except Exception as e:
-                skipped_flows += 1
-                print(f"Error processing flow '{flow_name}' in process '{process_name}': {str(e)}")
-                continue
-        
-        # Assign the total impacts for this process
-        results.loc[process_name] = process_impacts
+    # Determine number of workers (use 75% of available CPUs)
+    num_workers = max(1, int(cpu_count() * 0.75))
+    print(f"\nUsing {num_workers} workers for parallel processing")
+    
+    # Create a partial function with the required parameters
+    process_func = partial(calculate_process_impacts, lci_data=lci_data, cf_matrix=cf_matrix, impact_categories=impact_categories)
+    
+    # Process in parallel with progress bar
+    print("\nCalculating impacts for each process...")
+    
+    # Calculate optimal chunksize
+    chunksize = max(1, len(unique_processes) // (num_workers * 4))
+    
+    with Pool(num_workers) as pool:
+        # Use imap_unordered for better parallelization
+        process_results = []
+        for result in tqdm(
+            pool.imap_unordered(process_func, unique_processes, chunksize=chunksize),
+            total=len(unique_processes),
+            desc="Processing processes",
+            position=0,
+            leave=True,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+        ):
+            process_name, impacts, matched_count, unmatched_flows = result
+            process_results.append((process_name, impacts))
+            total_matched_flows += matched_count
+            all_unmatched_flows.extend(unmatched_flows)
+    
+    print("\nUpdating results...")
+    # Update results with parallel processing results
+    for process_name, impacts in tqdm(process_results, desc="Updating results", position=0, leave=True):
+        results.loc[process_name] = impacts
+    
+    # Save unmatched flows to CSV
+    if all_unmatched_flows:
+        unmatched_df = pd.DataFrame(all_unmatched_flows)
+        unmatched_df.to_csv('unmatched_flows.csv', index=False)
+        print(f"\nSaved {len(all_unmatched_flows)} unmatched flows to unmatched_flows.csv")
     
     # Report detailed matching statistics
     print(f"\nDetailed Flow Processing Statistics:")
     print(f"Total flows processed: {total_flows}")
-    print(f"Matched flows: {matched_flows} ({matched_flows/total_flows*100:.1f}%)")
-    print(f"Unmatched flows: {len(unmatched_flows)} ({len(unmatched_flows)/total_flows*100:.1f}%)")
+    print(f"Matched flows: {total_matched_flows} ({total_matched_flows/total_flows*100:.1f}%)")
+    print(f"Unmatched flows: {len(all_unmatched_flows)} ({len(all_unmatched_flows)/total_flows*100:.1f}%)")
     print(f"Flows with invalid amounts: {invalid_amounts} ({invalid_amounts/total_flows*100:.1f}%)")
     print(f"Flows with invalid names: {invalid_names} ({invalid_names/total_flows*100:.1f}%)")
-    print(f"Skipped flows (other errors): {skipped_flows} ({skipped_flows/total_flows*100:.1f}%)")
-    
-    # Report unmatched flows
-    if unmatched_flows:
-        print("\nWarning: The following flows were not found in the characterization matrix (showing first 20):")
-        for flow in sorted(list(unmatched_flows))[:20]:
-            print(f"  - {flow}")
-        if len(unmatched_flows) > 20:
-            print(f"  ... and {len(unmatched_flows) - 20} more")
     
     return results
 
@@ -406,7 +525,7 @@ def main():
         
         # Clean flow names and normalize compartments
         cf_matrix['Flow name'] = cf_matrix['Flow name'].str.strip()
-        cf_matrix['Compartment'] = cf_matrix['Compartment'].map(normalize_compartment)
+        cf_matrix['Compartment'] = cf_matrix['Compartment'].map(cached_normalize_compartment)
         
         # Create a multi-index using Flow name and Compartment
         cf_matrix.set_index(['Flow name', 'Compartment'], inplace=True)
@@ -431,7 +550,7 @@ def main():
         
         # Clean flow names and normalize compartments in LCI data
         lci_data['Flow name'] = lci_data['Flow name'].str.strip()
-        lci_data['Compartment'] = lci_data['Compartment'].map(normalize_compartment)
+        lci_data['Compartment'] = lci_data['Compartment'].map(cached_normalize_compartment)
         
         # Debug: Print LCI data info
         print("\nLCI data info:")

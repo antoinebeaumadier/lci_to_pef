@@ -1,6 +1,9 @@
 import os
 import pandas as pd
 import xml.etree.ElementTree as ET
+from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 def extract_exchanges(xml_file):
     """
@@ -96,21 +99,51 @@ def extract_exchanges(xml_file):
         print(f"Error processing file {xml_file}: {str(e)}")
         return []
 
+def process_single_xml(xml_file, directory):
+    """Process a single XML file"""
+    try:
+        # Parse the XML file
+        tree = ET.parse(os.path.join(directory, xml_file))
+        root = tree.getroot()
+        
+        # Process the file
+        results = extract_exchanges(os.path.join(directory, xml_file))
+        return results
+    except Exception as e:
+        print(f"Error processing {xml_file}: {str(e)}")
+        return []
+
 def process_xml_directory(directory):
-    """
-    Process all XML files in a directory and combine results into a single DataFrame.
-    Returns a DataFrame containing all exchanges with their process names.
-    """
-    all_exchanges = []
+    """Process all XML files in the directory and return a DataFrame with the results"""
+    # Get all XML files in the directory
+    xml_files = [f for f in os.listdir(directory) if f.endswith('.xml')]
     
-    for filename in os.listdir(directory):
-        if filename.endswith('.xml'):
-            file_path = os.path.join(directory, filename)
-            exchanges = extract_exchanges(file_path)
-            all_exchanges.extend(exchanges)
+    if not xml_files:
+        print("No XML files found in directory")
+        return pd.DataFrame()
     
-    if all_exchanges:
-        df = pd.DataFrame(all_exchanges)
+    # Determine number of workers (use 75% of available CPUs)
+    num_workers = max(1, int(cpu_count() * 0.75))
+    print(f"Using {num_workers} workers for parallel processing")
+    
+    # Create a partial function with the directory parameter
+    process_func = partial(process_single_xml, directory=directory)
+    
+    # Process files in parallel with progress bar
+    with Pool(num_workers) as pool:
+        # Use tqdm to show progress
+        results = list(tqdm(
+            pool.imap(process_func, xml_files),
+            total=len(xml_files),
+            desc="Processing XML files"
+        ))
+    
+    # Flatten results
+    all_results = [item for sublist in results for item in sublist]
+    
+    # Convert results to DataFrame
+    if all_results:
+        df = pd.DataFrame(all_results)
         # Save to Excel for reference
         df.to_excel('formatted_lci.xlsx', index=False)
         print(f"Processed data saved to formatted_lci.xlsx ({len(df)} rows)")
