@@ -59,35 +59,35 @@ def calculate_impacts(lci_data, cf_matrix):
     Calculate environmental impacts for each file based on LCI data and characterization factors.
     
     Args:
-        lci_data (pd.DataFrame): DataFrame containing LCI data with columns: Flow name, Amount, file
+        lci_data (pd.DataFrame): DataFrame containing LCI data with columns: Flow name, Amount, Process name
         cf_matrix (pd.DataFrame): DataFrame containing characterization factors indexed by flow names
         
     Returns:
-        pd.DataFrame: DataFrame with impact results per file
+        pd.DataFrame: DataFrame with impact results per process
     """
     # Get impact categories (all columns except index)
     impact_categories = cf_matrix.columns.tolist()
     
     # Initialize results DataFrame with zeros
-    unique_files = lci_data['file'].unique()
-    results = pd.DataFrame(0.0, index=unique_files, columns=impact_categories)
+    unique_processes = lci_data['Process name'].unique()
+    results = pd.DataFrame(0.0, index=unique_processes, columns=impact_categories)
     
     # Initialize counters for statistics
     total_flows = 0
     matched_flows = 0
     unmatched_flows = set()
     
-    # Process each file separately
-    for file_name in unique_files:
-        # Get flows for this file
-        file_flows = lci_data[lci_data['file'] == file_name]
-        total_flows += len(file_flows)
+    # Process each process separately
+    for process_name in unique_processes:
+        # Get flows for this process
+        process_flows = lci_data[lci_data['Process name'] == process_name]
+        total_flows += len(process_flows)
         
-        # Initialize file impacts array
-        file_impacts = np.zeros(len(impact_categories))
+        # Initialize process impacts array
+        process_impacts = np.zeros(len(impact_categories))
         
         # Calculate impacts for each flow
-        for _, flow in file_flows.iterrows():
+        for _, flow in process_flows.iterrows():
             flow_name = flow['Flow name']
             amount = flow['Amount']
             
@@ -100,14 +100,14 @@ def calculate_impacts(lci_data, cf_matrix):
                 matched_flows += 1
                 # Get characterization factors for all impact categories
                 factors = cf_matrix.loc[flow_name].to_numpy()  # Convert to numpy array
-                # Multiply amount by characterization factors and add to file impacts
+                # Multiply amount by characterization factors and add to process impacts
                 impact = factors * float(amount)
-                file_impacts = file_impacts + impact
+                process_impacts = process_impacts + impact
             else:
                 unmatched_flows.add(flow_name)
         
-        # Assign the total impacts for this file
-        results.loc[file_name] = file_impacts
+        # Assign the total impacts for this process
+        results.loc[process_name] = process_impacts
     
     # Report matching statistics
     print(f"\nFlow matching statistics:")
@@ -173,7 +173,7 @@ def main():
         print("\nFirst few rows of LCI data:")
         print(lci_data.head())
             
-        print(f"\nFound {len(lci_data)} exchanges across {len(lci_data['file'].unique())} files")
+        print(f"\nFound {len(lci_data)} exchanges across {len(lci_data['Process name'].unique())} processes")
         
         # Calculate impacts
         print("\nCalculating environmental impacts...")
@@ -186,13 +186,12 @@ def main():
         
         # Print summary statistics
         print("\nSummary of results:")
-        print(f"Number of files processed: {len(results)}")
-        print("\nMean impacts across all files:")
+        print(f"Number of processes processed: {len(results)}")
+        print("\nMean impacts across all processes:")
         print(results.mean())
         
-        # Save detailed results with file names
+        # Save detailed results with process names
         detailed_results = results.copy()
-        detailed_results.index.name = 'File'
         detailed_results.to_excel('detailed_impacts.xlsx')
         print("\nDetailed results saved to detailed_impacts.xlsx")
         

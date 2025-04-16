@@ -14,8 +14,22 @@ def extract_exchanges(xml_file):
         # Define namespace mapping
         ns = {
             'default': 'http://lca.jrc.it/ILCD/Process',
-            'common': 'http://lca.jrc.it/ILCD/Common'
+            'common': 'http://lca.jrc.it/ILCD/Common',
+            'xml': 'http://www.w3.org/XML/1998/namespace'
         }
+        
+        # Extract baseName from the XML - get English version
+        name_element = root.find('.//default:name', ns)
+        base_name = None
+        if name_element is not None:
+            for base_name_elem in name_element.findall('default:baseName', ns):
+                if base_name_elem.get('{http://www.w3.org/XML/1998/namespace}lang') == 'en':
+                    base_name = base_name_elem.text.strip()
+                    break
+        
+        # Fallback to filename if no English baseName found
+        if base_name is None:
+            base_name = os.path.basename(xml_file)
         
         exchanges = []
         
@@ -68,7 +82,8 @@ def extract_exchanges(xml_file):
                     'Amount': amount,
                     'Direction': 'Input' if is_input else 'Output',
                     'Compartment': compartment_text,
-                    'UUID': uuid
+                    'UUID': uuid,
+                    'Process name': base_name
                 })
                 
             except Exception as e:
@@ -84,7 +99,7 @@ def extract_exchanges(xml_file):
 def process_xml_directory(directory):
     """
     Process all XML files in a directory and combine results into a single DataFrame.
-    Returns a DataFrame containing all exchanges with their file names.
+    Returns a DataFrame containing all exchanges with their process names.
     """
     all_exchanges = []
     
@@ -92,9 +107,6 @@ def process_xml_directory(directory):
         if filename.endswith('.xml'):
             file_path = os.path.join(directory, filename)
             exchanges = extract_exchanges(file_path)
-            # Add file name to each exchange
-            for exchange in exchanges:
-                exchange['file'] = filename
             all_exchanges.extend(exchanges)
     
     if all_exchanges:
@@ -105,7 +117,7 @@ def process_xml_directory(directory):
         return df
     else:
         print("No exchanges found in the XML files")
-        return pd.DataFrame(columns=['Flow name', 'Amount', 'Direction', 'Compartment', 'UUID', 'file'])
+        return pd.DataFrame(columns=['Flow name', 'Amount', 'Direction', 'Compartment', 'UUID', 'Process name'])
 
 if __name__ == '__main__':
     # Process XML files in the current directory
