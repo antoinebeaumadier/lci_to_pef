@@ -109,17 +109,20 @@ def calculate_impacts(lci_data, cf_matrix):
     Returns:
         pd.DataFrame: DataFrame with impact results per process
     """
-    # Get impact categories (all columns except Flow name original)
+    # Get impact categories
     impact_categories = [col for col in cf_matrix.columns if col != 'Flow name original']
     
     # Initialize results DataFrame with zeros
     unique_processes = lci_data['Process name'].unique()
     results = pd.DataFrame(0.0, index=unique_processes, columns=impact_categories)
     
-    # Initialize counters for statistics
+    # Initialize counters for detailed statistics
     total_flows = 0
     matched_flows = 0
     unmatched_flows = set()
+    invalid_amounts = 0
+    invalid_names = 0
+    skipped_flows = 0
     
     # Convert characterization factors to numeric, replacing non-numeric values with 0
     for col in impact_categories:
@@ -140,9 +143,16 @@ def calculate_impacts(lci_data, cf_matrix):
             amount = flow['Amount']
             compartment = flow['Compartment']
             
-            # Skip if amount is not valid
+            # Track invalid amounts
             if pd.isna(amount):
+                invalid_amounts += 1
                 print(f"Warning: Invalid amount for flow '{flow_name}' in process '{process_name}'")
+                continue
+            
+            # Track invalid names
+            if pd.isna(flow_name) or not isinstance(flow_name, str) or not flow_name.strip():
+                invalid_names += 1
+                print(f"Warning: Invalid flow name in process '{process_name}'")
                 continue
             
             try:
@@ -179,25 +189,26 @@ def calculate_impacts(lci_data, cf_matrix):
                     if not np.any(np.isnan(impact)) and not np.any(np.isinf(impact)):
                         process_impacts += impact
                     else:
+                        skipped_flows += 1
                         print(f"Warning: Invalid impact values for flow '{flow_name}' in process '{process_name}'")
-                        print(f"Amount: {amount}")
-                        print(f"Factors: {total_factors}")
-                        print(f"Impact: {impact}")
                 else:
                     unmatched_flows.add(f"{flow_name} ({compartment})")
             except Exception as e:
+                skipped_flows += 1
                 print(f"Error processing flow '{flow_name}' in process '{process_name}': {str(e)}")
                 continue
         
         # Assign the total impacts for this process
         results.loc[process_name] = process_impacts
     
-    # Report matching statistics
-    print(f"\nFlow matching statistics:")
+    # Report detailed matching statistics
+    print(f"\nDetailed Flow Processing Statistics:")
     print(f"Total flows processed: {total_flows}")
-    if total_flows > 0:
-        print(f"Matched flows: {matched_flows} ({matched_flows/total_flows*100:.1f}%)")
-        print(f"Unmatched flows: {len(unmatched_flows)} ({len(unmatched_flows)/total_flows*100:.1f}%)")
+    print(f"Matched flows: {matched_flows} ({matched_flows/total_flows*100:.1f}%)")
+    print(f"Unmatched flows: {len(unmatched_flows)} ({len(unmatched_flows)/total_flows*100:.1f}%)")
+    print(f"Flows with invalid amounts: {invalid_amounts} ({invalid_amounts/total_flows*100:.1f}%)")
+    print(f"Flows with invalid names: {invalid_names} ({invalid_names/total_flows*100:.1f}%)")
+    print(f"Skipped flows (other errors): {skipped_flows} ({skipped_flows/total_flows*100:.1f}%)")
     
     # Report unmatched flows
     if unmatched_flows:
